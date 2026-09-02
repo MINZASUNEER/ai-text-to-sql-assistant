@@ -3,15 +3,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
+
 import os
 import sqlite3
 import re
 
+from app.clarification import detect_ambiguity
+from app.retriever import get_relevant_schema, index_schema
+
+
+# --------------------------------------------------
 # Load environment variables
+# --------------------------------------------------
+
 load_dotenv()
 
+
+# --------------------------------------------------
 # Create FastAPI app
+# --------------------------------------------------
+
 app = FastAPI()
+
+
+# --------------------------------------------------
+# Index database schema when backend starts
+# --------------------------------------------------
+
+@app.on_event("startup")
+def startup_event():
+    index_schema()
 
 
 # --------------------------------------------------
@@ -22,7 +43,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173"
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -51,61 +74,23 @@ class Question(BaseModel):
 
 
 # --------------------------------------------------
-# Database schema
-# --------------------------------------------------
-
-def get_database_schema():
-
-    connection = sqlite3.connect("database.db")
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'table'
-        AND name NOT LIKE 'sqlite_%'
-    """)
-
-    tables = cursor.fetchall()
-
-    schema = ""
-
-    for table in tables:
-
-        table_name = table[0]
-
-        cursor.execute(
-            f"PRAGMA table_info({table_name})"
-        )
-
-        columns = cursor.fetchall()
-
-        column_names = [
-            column[1]
-            for column in columns
-        ]
-
-        schema += f"Table: {table_name}\n"
-        schema += f"Columns: {', '.join(column_names)}\n\n"
-
-    connection.close()
-
-    return schema
-
-
-# --------------------------------------------------
 # SQL safety
 # --------------------------------------------------
 
 def is_safe_sql(sql):
-
     sql = sql.strip()
 
-    # Remove markdown if Gemini accidentally returns it
-    sql = re.sub(r"```sql", "", sql, flags=re.IGNORECASE)
+    # Remove markdown formatting if Gemini returns it
+    sql = re.sub(
+        r"```sql",
+        "",
+        sql,
+        flags=re.IGNORECASE
+    )
+
     sql = sql.replace("```", "").strip()
 
-    # Only allow SELECT
+    # Only allow SELECT queries
     if not sql.upper().startswith("SELECT"):
         return False
 
@@ -126,7 +111,6 @@ def is_safe_sql(sql):
     upper_sql = sql.upper()
 
     for command in dangerous_commands:
-
         if re.search(rf"\b{command}\b", upper_sql):
             return False
 
@@ -152,13 +136,34 @@ def execute_sql(sql):
         if cursor.description is None:
             return []
 
+        # Get column names
         columns = [
             description[0]
             for description in cursor.description
         ]
 
+        # Make duplicate column names unique
+        seen = {}
+        unique_columns = []
+
+        for column in columns:
+
+            if column not in seen:
+
+                seen[column] = 0
+                unique_columns.append(column)
+
+            else:
+
+                seen[column] += 1
+
+                unique_columns.append(
+                    f"{column}_{seen[column]}"
+                )
+
+        # Convert rows into dictionaries
         results = [
-            dict(zip(columns, row))
+            dict(zip(unique_columns, row))
             for row in rows
         ]
 
@@ -190,60 +195,123 @@ def ask_question(data: Question):
 
     question = data.question.strip()
 
-    # Check empty question
+
+    # --------------------------------------------------
+    # Empty question
+    # --------------------------------------------------
+
     if not question:
 
         return {
             "question": question,
+            "status": "error",
+            "clarification_question": None,
             "sql": "",
             "results": [],
             "error": "Please enter a question."
         }
 
 
-    # Get database schema
-    try:
+    # --------------------------------------------------
+    # 1. Ambiguity Check
+    # --------------------------------------------------
 
-        schema = get_database_schema()
+    clarification_result = detect_ambiguity(question)
 
-    except Exception as error:
+    if clarification_result["needs_clarification"]:
 
         return {
             "question": question,
+            "status": "needs_clarification",
+            "clarification_question": (
+                clarification_result[
+                    "clarification_question"
+                ]
+            ),
             "sql": "",
             "results": [],
-            "error": f"Database error: {str(error)}"
+            "error": None
         }
 
 
-    # Gemini prompt
+    # --------------------------------------------------
+    # 2. RAG Schema Retrieval
+    # --------------------------------------------------
+
+    try:
+
+        relevant_schema = get_relevant_schema(
+            question,
+            top_k=5
+        )
+
+    except Exception as error:
+
+        print("RAG ERROR:", error)
+
+        return {
+            "question": question,
+            "status": "error",
+            "clarification_question": None,
+            "sql": "",
+            "results": [],
+            "error": (
+                f"Schema retrieval error: {str(error)}"
+            )
+        }
+
+
+    # --------------------------------------------------
+    # 3. Prompt Construction
+    # --------------------------------------------------
+
     prompt = f"""
-You are a Text-to-SQL assistant.
+You are an expert Text-to-SQL assistant.
 
-Convert the user's English question into
-a valid SQLite SQL query.
+Convert the user's English question into a valid SQLite SQL query.
 
-Database schema:
+Use ONLY the database schema provided below.
 
-{schema}
+Relevant Database Schema:
+{relevant_schema}
 
 User question:
-
 {question}
 
 Rules:
-- Return ONLY the SQL query.
-- Do not use markdown.
-- Do not use ```sql.
-- Use only tables and columns that exist.
-- Use valid SQLite syntax.
-- Only generate SELECT queries.
+
+1. Return ONLY the SQL query.
+2. Do not return explanations.
+3. Do not use markdown code blocks.
+4. Use only tables and columns present in the schema.
+5. Use valid SQLite syntax.
+6. Only generate SELECT queries.
+7. If the question requires information from multiple tables,
+   use an appropriate JOIN.
+8. Use the relationships provided in the schema when joining tables.
+9. When selecting columns with the same name from different tables,
+   ALWAYS use clear aliases.
+10. When filtering using a table from another table,
+    use the appropriate JOIN.
+11. Do not invent table names or column names.
+
+Example:
+
+SELECT
+    students.name AS student_name,
+    departments.name AS department_name
+FROM students
+JOIN departments
+    ON students.department_id = departments.id;
 
 SQL:
 """
 
 
-    # Ask Gemini
+    # --------------------------------------------------
+    # 4. Generate SQL using Gemini
+    # --------------------------------------------------
+
     try:
 
         response = client.models.generate_content(
@@ -253,17 +321,31 @@ SQL:
 
         sql = response.text.strip()
 
-    except Exception:
+    except Exception as error:
+
+        # Print the REAL Gemini error in terminal
+        print("========================================")
+        print("GEMINI ERROR:")
+        print(error)
+        print("========================================")
 
         return {
             "question": question,
+            "status": "error",
+            "clarification_question": None,
             "sql": "",
             "results": [],
-            "error": "AI service is temporarily unavailable. Please try again."
+            "error": (
+                "AI service is temporarily unavailable. "
+                "Please try again."
+            )
         }
 
 
-    # Clean SQL
+    # --------------------------------------------------
+    # Clean generated SQL
+    # --------------------------------------------------
+
     sql = re.sub(
         r"```sql",
         "",
@@ -274,35 +356,60 @@ SQL:
     sql = sql.replace("```", "").strip()
 
 
-    # Check SQL safety
+    # --------------------------------------------------
+    # 5. SQL Safety Validation
+    # --------------------------------------------------
+
     if not is_safe_sql(sql):
+
+        print("UNSAFE SQL REJECTED:", sql)
 
         return {
             "question": question,
+            "status": "error",
+            "clarification_question": None,
             "sql": sql,
             "results": [],
-            "error": "The generated SQL query was rejected for safety reasons."
+            "error": (
+                "The generated SQL query was "
+                "rejected for safety reasons."
+            )
         }
 
 
-    # Execute SQL
+    # --------------------------------------------------
+    # 6. Execute SQL
+    # --------------------------------------------------
+
     try:
 
         results = execute_sql(sql)
 
-    except Exception:
+    except Exception as error:
+
+        print("SQL EXECUTION ERROR:", error)
+        print("GENERATED SQL:", sql)
 
         return {
             "question": question,
+            "status": "error",
+            "clarification_question": None,
             "sql": sql,
             "results": [],
-            "error": "The generated SQL could not be executed."
+            "error": (
+                "The generated SQL could not be executed."
+            )
         }
 
 
-    # Successful response
+    # --------------------------------------------------
+    # 7. Return response
+    # --------------------------------------------------
+
     return {
         "question": question,
+        "status": "success",
+        "clarification_question": None,
         "sql": sql,
         "results": results,
         "error": None

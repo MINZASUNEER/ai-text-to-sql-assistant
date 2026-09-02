@@ -1,12 +1,22 @@
 import { useState } from "react";
 import "./App.css";
 
+interface BackendResponse {
+  question: string;
+  status: "success" | "needs_clarification" | "error";
+  clarification_question: string | null;
+  sql: string;
+  results: Record<string, any>[];
+  error: string | null;
+}
+
 function App() {
   const [question, setQuestion] = useState("");
   const [sql, setSql] = useState("");
   const [results, setResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [clarification, setClarification] = useState("");
 
   const askAI = async () => {
     if (!question.trim()) {
@@ -16,6 +26,7 @@ function App() {
 
     setLoading(true);
     setError("");
+    setClarification("");
     setSql("");
     setResults([]);
 
@@ -30,14 +41,20 @@ function App() {
         }),
       });
 
-      const data = await response.json();
+      const data: BackendResponse = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.detail || "Something went wrong");
+        throw new Error(data.error || "Something went wrong");
       }
 
-      setSql(data.sql);
-      setResults(data.results || []);
+      if (data.status === "needs_clarification") {
+        setClarification(data.clarification_question || "Please clarify your request.");
+      } else if (data.status === "error") {
+        setError(data.error || "An error occurred.");
+      } else {
+        setSql(data.sql);
+        setResults(data.results || []);
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -50,6 +67,7 @@ function App() {
     setSql("");
     setResults([]);
     setError("");
+    setClarification("");
   };
 
   return (
@@ -82,6 +100,12 @@ function App() {
 
           </div>
         </div>
+
+        {clarification && (
+          <div className="warning" style={{ backgroundColor: '#fff3cd', color: '#856404', padding: '15px', borderRadius: '8px', marginBottom: '20px' }}>
+            🤔 <strong>Clarification Needed:</strong> {clarification}
+          </div>
+        )}
 
         {error && (
           <div className="error">
